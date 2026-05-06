@@ -63,12 +63,10 @@ type CommandParams struct {
 
 // CommandCodeMessage is one message in the upstream request.
 //
-// CommandCode (Anthropic-style API) requires:
-//   - role in {"user", "assistant", "tool"}
-//   - content as an array of typed parts (NOT a plain string)
-//
-// We always emit content as an array even when there is just one text
-// part, because the upstream rejects strings outright with a 400.
+// CommandCode accepts normal chat roles user/assistant. Some clients
+// such as 9Router may send OpenAI tool messages without the full
+// CommandCode tool-result shape; normalizeMessages flattens those tool
+// messages into user text so upstream validation does not reject them.
 type CommandCodeMessage struct {
 	Role    string                   `json:"role"`
 	Content []CommandCodeContentPart `json:"content"`
@@ -165,8 +163,9 @@ func prependSystemText(sysText string, parts []CommandCodeContentPart) []Command
 //     is prepended). Multiple consecutive systems are joined with "\n\n".
 //     A trailing system (no user after) is attached to the last user
 //     message, or otherwise becomes a new user message at the end.
-//   - role is restricted to user/assistant/tool. Anything else is
-//     rewritten to "user" (CommandCode rejects unknown roles with 400).
+//   - role is restricted to user/assistant. OpenAI tool messages from
+//     routers are flattened into user text because CommandCode requires
+//     a richer tool-result content shape that those clients do not send.
 //   - content is always emitted as a non-empty array of typed parts.
 func normalizeMessages(in []ChatMessage) []CommandCodeMessage {
 	out := make([]CommandCodeMessage, 0, len(in))
@@ -189,7 +188,10 @@ func normalizeMessages(in []ChatMessage) []CommandCodeMessage {
 			appendSystem(FlattenContent(m.Content))
 			continue
 		}
-		if role != "user" && role != "assistant" && role != "tool" {
+		if role == "tool" {
+			role = "user"
+		}
+		if role != "user" && role != "assistant" {
 			role = "user"
 		}
 		parts := flattenToParts(m.Content)
