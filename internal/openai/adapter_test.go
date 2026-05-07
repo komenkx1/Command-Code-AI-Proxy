@@ -201,8 +201,8 @@ func TestToOpenAI(t *testing.T) {
 	if cc.Model != "moonshotai/Kimi-K2.5" {
 		t.Errorf("model = %q", cc.Model)
 	}
-	if cc.Choices[0].Message.Content != " Hello! How can I help you today?" {
-		t.Errorf("content = %q", cc.Choices[0].Message.Content)
+	if cc.Choices[0].Message.Content == nil || *cc.Choices[0].Message.Content != " Hello! How can I help you today?" {
+		t.Errorf("content = %v", cc.Choices[0].Message.Content)
 	}
 	if cc.Choices[0].FinishReason != "stop" {
 		t.Errorf("finish_reason = %q, want stop", cc.Choices[0].FinishReason)
@@ -309,5 +309,191 @@ func TestFlattenContentWithImage(t *testing.T) {
 	got := FlattenContent(m.Content)
 	if !strings.Contains(got, "see") || !strings.Contains(got, "[image omitted]") {
 		t.Errorf("flatten = %q", got)
+	}
+}
+
+func TestExtractToolUseBlocks(t *testing.T) {
+	content := []any{
+		map[string]any{"type": "text", "text": "I'll read that file."},
+		map[string]any{
+			"type":  "tool_use",
+			"id":    "toolu_abc123",
+			"name":  "read",
+			"input": map[string]any{"file_path": "/Users/mangwahyu/weather-widget.html"},
+		},
+	}
+
+	calls := ExtractToolUseBlocks(content)
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	if calls[0].ID != "toolu_abc123" {
+		t.Errorf("id = %q", calls[0].ID)
+	}
+	if calls[0].Type != "function" {
+		t.Errorf("type = %q", calls[0].Type)
+	}
+	if calls[0].Function.Name != "read" {
+		t.Errorf("name = %q", calls[0].Function.Name)
+	}
+	if !json.Valid([]byte(calls[0].Function.Arguments)) {
+		t.Fatalf("arguments is invalid JSON: %q", calls[0].Function.Arguments)
+	}
+	if !strings.Contains(calls[0].Function.Arguments, "weather-widget.html") {
+		t.Errorf("arguments = %q", calls[0].Function.Arguments)
+	}
+}
+
+func TestExtractTextContentSkipsToolUseBlocks(t *testing.T) {
+	content := []any{
+		map[string]any{"type": "text", "text": "Before. "},
+		map[string]any{"type": "tool_use", "id": "toolu_1", "name": "read", "input": map[string]any{"file_path": "x"}},
+		map[string]any{"type": "text", "text": "After."},
+	}
+
+	got := ExtractTextContent(content)
+	if got != "Before. After." {
+		t.Errorf("text = %q, want %q", got, "Before. After.")
+	}
+}
+
+func TestParseTextToolCalls(t *testing.T) {
+	text := "**Calling:** `read`\n```\n{\"file_path\": \"/Users/mangwahyu/weather-widget.html\"}\n```"
+
+	calls, remaining := ParseTextToolCalls(text)
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	if remaining != "" {
+		t.Errorf("remaining = %q, want empty", remaining)
+	}
+	if calls[0].ID == "" || !strings.HasPrefix(calls[0].ID, "call_") {
+		t.Errorf("id = %q, want generated call_ id", calls[0].ID)
+	}
+	if calls[0].Function.Name != "read" {
+		t.Errorf("name = %q", calls[0].Function.Name)
+	}
+	if calls[0].Function.Arguments != `{"file_path": "/Users/mangwahyu/weather-widget.html"}` {
+		t.Errorf("arguments = %q", calls[0].Function.Arguments)
+	}
+}
+
+func TestParseTextToolCallsWithJSONFence(t *testing.T) {
+	text := "Let me inspect it.\n\n**Calling:** `read`\n```json\n{\"file_path\": \"/tmp/a.go\"}\n```\n\nDone marker."
+
+	calls, remaining := ParseTextToolCalls(text)
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	if calls[0].Function.Name != "read" {
+		t.Errorf("name = %q", calls[0].Function.Name)
+	}
+	if !strings.Contains(remaining, "Let me inspect it.") || !strings.Contains(remaining, "Done marker.") {
+		t.Errorf("remaining = %q", remaining)
+	}
+	if strings.Contains(remaining, "Calling") {
+		t.Errorf("remaining still contains tool call marker: %q", remaining)
+	}
+}
+
+func TestParseTextToolCallsInvalidJSONWrapsRaw(t *testing.T) {
+	text := "**Calling:** `read`\n```\nnot-json\n```"
+
+	calls, _ := ParseTextToolCalls(text)
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	if !json.Valid([]byte(calls[0].Function.Arguments)) {
+		t.Fatalf("arguments is invalid JSON: %q", calls[0].Function.Arguments)
+	}
+	if !strings.Contains(calls[0].Function.Arguments, "not-json") {
+		t.Errorf("arguments = %q, want raw text wrapped", calls[0].Function.Arguments)
+	}
+}
+
+func TestToOpenAI_NativeToolUseBlock(t *testing.T) {
+	upstream := map[string]any{
+		"id":   "msg_tool",
+		"role": "assistant",
+		"content": []any{
+			map[string]any{"type": "text", "text": "I'll read it."},
+			map[string]any{"type": "tool_use", "id": "toolu_read_1", "name": "read", "input": map[string]any{"file_path": "/tmp/a.go"}},
+		},
+		"stop_reason": "tool_use",
+		"usage":       map[string]any{"input_tokens": float64(10), "output_tokens": float64(5)},
+	}
+
+	cc := ToOpenAI(upstream, "x")
+	choice := cc.Choices[0]
+	if choice.FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls", choice.FinishReason)
+	}
+	if choice.Message.Content == nil || *choice.Message.Content != "I'll read it." {
+		t.Errorf("content = %v", choice.Message.Content)
+	}
+	if len(choice.Message.ToolCalls) != 1 {
+		t.Fatalf("tool_calls = %d, want 1", len(choice.Message.ToolCalls))
+	}
+	call := choice.Message.ToolCalls[0]
+	if call.ID != "toolu_read_1" || call.Type != "function" || call.Function.Name != "read" {
+		t.Errorf("tool call = %+v", call)
+	}
+	if !strings.Contains(call.Function.Arguments, "/tmp/a.go") {
+		t.Errorf("arguments = %q", call.Function.Arguments)
+	}
+}
+
+func TestToOpenAI_TextBasedToolCallOverridesEndTurn(t *testing.T) {
+	upstream := map[string]any{
+		"id":          "msg_text_tool",
+		"role":        "assistant",
+		"content":     []any{map[string]any{"type": "text", "text": "**Calling:** `read`\n```\n{\"file_path\": \"/tmp/a.go\"}\n```"}},
+		"stop_reason": "end_turn",
+		"usage":       map[string]any{"input_tokens": float64(10), "output_tokens": float64(5)},
+	}
+
+	cc := ToOpenAI(upstream, "x")
+	choice := cc.Choices[0]
+	if choice.FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls", choice.FinishReason)
+	}
+	if choice.Message.Content != nil {
+		t.Errorf("content = %q, want nil after removing pure tool call text", *choice.Message.Content)
+	}
+	if len(choice.Message.ToolCalls) != 1 {
+		t.Fatalf("tool_calls = %d, want 1", len(choice.Message.ToolCalls))
+	}
+	if choice.Message.ToolCalls[0].Function.Name != "read" {
+		t.Errorf("name = %q", choice.Message.ToolCalls[0].Function.Name)
+	}
+}
+
+func TestBuildStreamChunksToolCall(t *testing.T) {
+	upstream := map[string]any{
+		"id":          "msg_tool_stream",
+		"content":     []any{map[string]any{"type": "tool_use", "id": "toolu_1", "name": "read", "input": map[string]any{"file_path": "/tmp/a.go"}}},
+		"stop_reason": "tool_use",
+	}
+
+	chunks := BuildStreamChunks(upstream, "x")
+	if len(chunks) != 4 {
+		t.Fatalf("chunks = %d, want 4 (role, tool name, tool args, finish)", len(chunks))
+	}
+	if r, _ := chunks[0].Choices[0].Delta["role"].(string); r != "assistant" {
+		t.Errorf("first chunk role = %q", r)
+	}
+	toolDelta, ok := chunks[1].Choices[0].Delta["tool_calls"].([]StreamToolCallDelta)
+	if !ok || len(toolDelta) != 1 {
+		t.Fatalf("tool_calls delta = %#v", chunks[1].Choices[0].Delta["tool_calls"])
+	}
+	if toolDelta[0].ID != "toolu_1" || toolDelta[0].Function == nil || toolDelta[0].Function.Name != "read" {
+		t.Errorf("tool name delta = %+v", toolDelta[0])
+	}
+	argsDelta, ok := chunks[2].Choices[0].Delta["tool_calls"].([]StreamToolCallDelta)
+	if !ok || len(argsDelta) != 1 || argsDelta[0].Function == nil || !strings.Contains(argsDelta[0].Function.Arguments, "/tmp/a.go") {
+		t.Fatalf("tool args delta = %#v", chunks[2].Choices[0].Delta["tool_calls"])
+	}
+	if fr, _ := chunks[3].Choices[0].FinishReason.(string); fr != "tool_calls" {
+		t.Errorf("finish chunk = %q, want tool_calls", fr)
 	}
 }
