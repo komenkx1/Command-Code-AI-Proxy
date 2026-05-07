@@ -30,6 +30,96 @@ var stopReasonMap = map[string]string{
 	"content_filter": "content_filter",
 }
 
+// ---------------------------------------------------------------------------
+// Tool argument normalisation
+// ---------------------------------------------------------------------------
+//
+// OpenAI-compatible agents often hallucinate parameter names that differ
+// from the tool schema they were given (e.g. "file_path" instead of
+// "path").  The map below maps *known bad* names to the canonical ones
+// we see in real tool schemas.  Only keys that exist in the parsed
+// arguments are rewritten; missing keys are left untouched.
+//
+// The mapping is keyed by the tool function name so we only touch
+// arguments for tools we recognise, minimising false positives.
+
+var toolArgNormalizers = map[string]map[string]string{
+	"edit": {
+		"file_path":     "path",
+		"filepath":      "path",
+		"filePath":      "path",
+		"oldText":       "old_string",
+		"old_string":    "old_string",
+		"newText":       "new_string",
+		"new_string":    "new_string",
+	},
+	"read": {
+		"file_path":     "path",
+		"filepath":      "path",
+		"filePath":      "path",
+	},
+	"write": {
+		"file_path":     "path",
+		"filepath":      "path",
+		"filePath":      "path",
+	},
+	"delete": {
+		"file_path":     "path",
+		"filepath":      "path",
+		"filePath":      "path",
+	},
+	"bash": {
+		"command":       "command",
+		"cmd":           "command",
+	},
+	"search": {
+		"search_term":   "query",
+		"searchTerm":    "query",
+		"term":          "query",
+	},
+}
+
+// NormalizeToolCallArguments rewrites the JSON-encoded arguments string
+// for a known tool so that common hallucinated parameter names are
+// replaced with their canonical counterparts.  It returns the (possibly
+// unchanged) JSON string and a flag indicating whether any rewrite
+// actually happened.
+func NormalizeToolCallArguments(toolName, argsJSON string) (string, bool) {
+	rules, ok := toolArgNormalizers[toolName]
+	if !ok {
+		return argsJSON, false
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &parsed); err != nil {
+		log.Printf("[toolcall] warning: cannot unmarshal arguments for %q normalization: %v", toolName, err)
+		return argsJSON, false
+	}
+
+	changed := false
+	for badKey, goodKey := range rules {
+		if val, exists := parsed[badKey]; exists {
+			if _, alreadyOK := parsed[goodKey]; !alreadyOK {
+				parsed[goodKey] = val
+				delete(parsed, badKey)
+				changed = true
+				log.Printf("[toolcall] normalized %q → %q for tool %q", badKey, goodKey, toolName)
+			}
+		}
+	}
+
+	if !changed {
+		return argsJSON, false
+	}
+
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		log.Printf("[toolcall] warning: cannot marshal normalized arguments for %q: %v", toolName, err)
+		return argsJSON, false
+	}
+	return string(out), true
+}
+
 // ChatRequest is the subset of the OpenAI Chat Completions request body
 // that we read. Unknown fields are ignored.
 type ChatRequest struct {
@@ -420,6 +510,10 @@ func ExtractToolUseBlocks(content any) []ToolCall {
 		} else {
 			args = "{}"
 		}
+		// Normalize common hallucinated parameter names
+		if norm, ok := NormalizeToolCallArguments(name, args); ok {
+			args = norm
+		}
 		log.Printf("[toolcall] extracted native tool_use block: name=%q id=%q args_len=%d", name, id, len(args))
 		calls = append(calls, ToolCall{
 			ID:   id,
@@ -489,6 +583,11 @@ func ParseTextToolCalls(text string) ([]ToolCall, string) {
 			// Wrap non-JSON arguments as a JSON string value
 			b, _ := json.Marshal(map[string]string{"raw": rawArgs})
 			rawArgs = string(b)
+		}
+
+		// Normalize common hallucinated parameter names
+		if norm, ok := NormalizeToolCallArguments(name, rawArgs); ok {
+			rawArgs = norm
 		}
 
 		id := "call_" + randomHex(12)

@@ -373,8 +373,11 @@ func TestParseTextToolCalls(t *testing.T) {
 	if calls[0].Function.Name != "read" {
 		t.Errorf("name = %q", calls[0].Function.Name)
 	}
-	if calls[0].Function.Arguments != `{"file_path": "/Users/mangwahyu/weather-widget.html"}` {
-		t.Errorf("arguments = %q", calls[0].Function.Arguments)
+	if !strings.Contains(calls[0].Function.Arguments, "weather-widget.html") {
+		t.Errorf("arguments = %q, missing expected file path", calls[0].Function.Arguments)
+	}
+	if strings.Contains(calls[0].Function.Arguments, "file_path") {
+		t.Errorf("arguments = %q, should have normalized file_path → path", calls[0].Function.Arguments)
 	}
 }
 
@@ -495,5 +498,136 @@ func TestBuildStreamChunksToolCall(t *testing.T) {
 	}
 	if fr, _ := chunks[3].Choices[0].FinishReason.(string); fr != "tool_calls" {
 		t.Errorf("finish chunk = %q, want tool_calls", fr)
+	}
+}
+
+func TestNormalizeToolCallArgumentsEditFilepath(t *testing.T) {
+	original := `{"file_path": "/tmp/weather-widget.html", "oldText": "old", "newText": "new"}`
+	normalized, changed := NormalizeToolCallArguments("edit", original)
+	if !changed {
+		t.Fatal("should have changed arguments")
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
+		t.Fatalf("invalid JSON after normalization: %v", err)
+	}
+	if _, exists := parsed["file_path"]; exists {
+		t.Error("file_path key should have been removed")
+	}
+	if _, exists := parsed["path"]; !exists {
+		t.Error("path key should exist")
+	}
+	if _, exists := parsed["oldText"]; exists {
+		t.Error("oldText key should have been removed")
+	}
+	if _, exists := parsed["old_string"]; !exists {
+		t.Error("old_string key should exist")
+	}
+	if _, exists := parsed["newText"]; exists {
+		t.Error("newText key should have been removed")
+	}
+	if _, exists := parsed["new_string"]; !exists {
+		t.Error("new_string key should exist")
+	}
+}
+
+func TestNormalizeToolCallArgumentsReadFilepath(t *testing.T) {
+	original := `{"filepath": "/tmp/test.go"}`
+	normalized, changed := NormalizeToolCallArguments("read", original)
+	if !changed {
+		t.Fatal("should have changed arguments")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
+		t.Fatalf("invalid JSON after normalization: %v", err)
+	}
+	if _, exists := parsed["file_path"]; exists {
+		t.Error("file_path key should have been removed")
+	}
+	if _, exists := parsed["path"]; !exists {
+		t.Error("path key should exist")
+	}
+}
+
+func TestNormalizeToolCallArgumentsUnknownToolDoesNothing(t *testing.T) {
+	original := `{"file_path": "/tmp/test.go"}`
+	normalized, changed := NormalizeToolCallArguments("some_other_tool", original)
+	if changed {
+		t.Fatal("should not have changed arguments for unknown tool")
+	}
+	if normalized != original {
+		t.Error("arguments should be unchanged")
+	}
+}
+
+func TestNormalizeToolCallArgumentsInvalidJSONReturnsUnchanged(t *testing.T) {
+	original := `this is not json`
+	normalized, changed := NormalizeToolCallArguments("edit", original)
+	if changed {
+		t.Fatal("should not have changed invalid JSON")
+	}
+	if normalized != original {
+		t.Error("invalid JSON should be returned unchanged")
+	}
+}
+
+func TestTextBasedToolCallIsAutoNormalized(t *testing.T) {
+	text := "**Calling:** `edit`\n```\n{\"file_path\": \"/tmp/weather-widget.html\", \"oldText\": \"Gianyar\", \"newText\": \"Denpasar\"}\n```"
+
+	calls, _ := ParseTextToolCalls(text)
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	call := calls[0]
+	if call.Function.Name != "edit" {
+		t.Errorf("name = %q", call.Function.Name)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &parsed); err != nil {
+		t.Fatalf("invalid JSON arguments: %v", err)
+	}
+	if _, exists := parsed["path"]; !exists {
+		t.Error("file_path should have been normalized to path")
+	}
+	if _, exists := parsed["old_string"]; !exists {
+		t.Error("oldText should have been normalized to old_string")
+	}
+	if _, exists := parsed["new_string"]; !exists {
+		t.Error("newText should have been normalized to new_string")
+	}
+}
+
+func TestNativeToolUseIsAutoNormalized(t *testing.T) {
+	content := []any{
+		map[string]any{
+			"type": "tool_use",
+			"id":   "toolu_abc",
+			"name": "edit",
+			"input": map[string]any{
+				"file_path": "/tmp/file.html",
+				"oldText":   "old value",
+				"newText":   "new value",
+			},
+		},
+	}
+
+	calls := ExtractToolUseBlocks(content)
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	call := calls[0]
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &parsed); err != nil {
+		t.Fatalf("invalid JSON arguments: %v", err)
+	}
+	if _, exists := parsed["path"]; !exists {
+		t.Error("file_path should have been normalized to path")
+	}
+	if _, exists := parsed["old_string"]; !exists {
+		t.Error("oldText should have been normalized to old_string")
+	}
+	if _, exists := parsed["new_string"]; !exists {
+		t.Error("newText should have been normalized to new_string")
 	}
 }
